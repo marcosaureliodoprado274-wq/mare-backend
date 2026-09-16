@@ -4,7 +4,6 @@ const { requireAuth, requireRole } = require("../middleware/auth");
 
 const router = express.Router();
 
-// Distância aproximada em km entre dois pontos (fórmula de Haversine)
 function distanceKm(lat1, lng1, lat2, lng2) {
   const R = 6371;
   const dLat = ((lat2 - lat1) * Math.PI) / 180;
@@ -15,14 +14,10 @@ function distanceKm(lat1, lng1, lat2, lng2) {
   return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
-// ---------------------------------------------------------------------------
-// POST /rides — passageiro pede uma corrida
-// body: { pickup_lat, pickup_lng, pickup_address, dropoff_lat, dropoff_lng, dropoff_address }
-// ---------------------------------------------------------------------------
 router.post("/", requireAuth, requireRole("passenger"), async (req, res) => {
   const {
     pickup_lat, pickup_lng, pickup_address, dropoff_lat, dropoff_lng, dropoff_address,
-    payment_method = "pix", // 'pix' | 'cartao' | 'especie'
+    payment_method = "pix",
   } = req.body;
 
   if (!["pix", "cartao", "especie"].includes(payment_method)) {
@@ -36,8 +31,6 @@ router.post("/", requireAuth, requireRole("passenger"), async (req, res) => {
       return res.status(400).json({ error: "Serviço ainda não está ativo nesta cidade" });
     }
 
-    // Verifica se coleta ou destino passam perto de uma zona de risco ativa
-    // nesse horário — aviso informativo, não bloqueia a corrida.
     const currentHour = new Date().getHours();
     const zonesResult = await pool.query(
       `SELECT * FROM risk_zones WHERE city_id = $1 AND is_active = true`,
@@ -48,7 +41,7 @@ router.post("/", requireAuth, requireRole("passenger"), async (req, res) => {
         zone.active_from_hour == null ||
         (zone.active_from_hour <= zone.active_to_hour
           ? currentHour >= zone.active_from_hour && currentHour < zone.active_to_hour
-          : currentHour >= zone.active_from_hour || currentHour < zone.active_to_hour); // cruza a meia-noite
+          : currentHour >= zone.active_from_hour || currentHour < zone.active_to_hour);
       if (!withinHours) return false;
 
       const distToPickup = distanceKm(pickup_lat, pickup_lng, zone.center_lat, zone.center_lng) * 1000;
@@ -57,7 +50,7 @@ router.post("/", requireAuth, requireRole("passenger"), async (req, res) => {
     }).map((z) => ({ name: z.name, level: z.level }));
 
     const distance_km = distanceKm(pickup_lat, pickup_lng, dropoff_lat, dropoff_lng);
-    const estimated_duration_min = Math.round((distance_km / 25) * 60); // ~25km/h médio urbano
+    const estimated_duration_min = Math.round((distance_km / 25) * 60);
 
     const fare_total =
       Number(city.base_fare) +
@@ -82,11 +75,7 @@ router.post("/", requireAuth, requireRole("passenger"), async (req, res) => {
     );
 
     const ride = { ...result.rows[0], risk_warnings };
-
-    // Notifica motoristas online próximos via socket.io (ver server.js),
-    // já incluindo os avisos de zona de risco pra decisão informada
     req.app.get("io")?.to(`city:${req.user.city_id}:drivers`).emit("ride:new", ride);
-
     res.status(201).json(ride);
   } catch (err) {
     console.error(err);
@@ -94,9 +83,6 @@ router.post("/", requireAuth, requireRole("passenger"), async (req, res) => {
   }
 });
 
-// ---------------------------------------------------------------------------
-// POST /rides/:id/accept — motorista aceita a corrida
-// ---------------------------------------------------------------------------
 router.post("/:id/accept", requireAuth, requireRole("driver"), async (req, res) => {
   try {
     const vehicle = await pool.query(`SELECT id FROM vehicles WHERE driver_id = $1 LIMIT 1`, [req.user.id]);
@@ -122,9 +108,6 @@ router.post("/:id/accept", requireAuth, requireRole("driver"), async (req, res) 
   }
 });
 
-// ---------------------------------------------------------------------------
-// PATCH /rides/:id/status — atualiza status (driver_arriving, in_progress, completed, cancelled_*)
-// ---------------------------------------------------------------------------
 router.patch("/:id/status", requireAuth, async (req, res) => {
   const { status } = req.body;
   const validStatuses = [
@@ -152,11 +135,8 @@ router.patch("/:id/status", requireAuth, async (req, res) => {
 
     const ride = result.rows[0];
 
-    // Ao completar, trata o pagamento de forma diferente por método
     if (status === "completed") {
       if (ride.payment_method === "especie") {
-        // Dinheiro fica direto com o motorista; ele passa a dever a comissão
-        // da plataforma, acumulada no saldo dele.
         await pool.query(
           `INSERT INTO payments (ride_id, method, amount, status, platform_fee_owed_by_driver, paid_at)
            VALUES ($1, 'especie', $2, 'paid', $3, now())
@@ -171,8 +151,6 @@ router.patch("/:id/status", requireAuth, async (req, res) => {
           [ride.driver_id, ride.platform_fee]
         );
       } else {
-        // Pix ou cartão: o valor entra pela plataforma, que repassa ao motorista
-        // (integração real com o gateway de pagamento entra aqui futuramente).
         await pool.query(
           `INSERT INTO payments (ride_id, method, amount, status)
            VALUES ($1, $2, $3, 'pending')
@@ -190,18 +168,20 @@ router.patch("/:id/status", requireAuth, async (req, res) => {
   }
 });
 
-// ---------------------------------------------------------------------------
-// GET /rides/:id
-// ---------------------------------------------------------------------------
+router.get("/open", requireAuth, requireRole("driver"), async (req, res) => {
+  const result = await pool.query(
+    `SELECT * FROM rides WHERE city_id = $1 AND status = 'requested' ORDER BY requested_at ASC LIMIT 10`,
+    [req.user.city_id]
+  );
+  res.json(result.rows);
+});
+
 router.get("/:id", requireAuth, async (req, res) => {
   const result = await pool.query(`SELECT * FROM rides WHERE id = $1`, [req.params.id]);
   if (!result.rows[0]) return res.status(404).json({ error: "Corrida não encontrada" });
   res.json(result.rows[0]);
 });
 
-// ---------------------------------------------------------------------------
-// GET /rides — histórico do usuário logado
-// ---------------------------------------------------------------------------
 router.get("/", requireAuth, async (req, res) => {
   const column = req.user.role === "driver" ? "driver_id" : "passenger_id";
   const result = await pool.query(
